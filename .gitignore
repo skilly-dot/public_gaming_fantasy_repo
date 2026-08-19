@@ -1,0 +1,264 @@
+# ===== GO =====
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+build/
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+coverage.html
+coverage/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# ===== ENVIRONMENT =====
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+.env.staging
+!.env.example
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== NODE =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# ===== BUILD OUTPUT =====
+dist/
+build/
+.next/
+out/
+.cache/
+.parcel-cache/
+.turbo/
+
+# ===== TESTING =====
+coverage/
+.nyc_output/
+cypress/videos/
+cypress/screenshots/
+playwright-report/
+test-results/
+
+# ===== LOGS =====
+logs/
+*.log
+*.log.*
+log/
+tmp/
+temp/
+
+# ===== DATABASE =====
+*.db
+*.sqlite
+*.sqlite3
+pgdata/
+redisdata/
+mongodata/
+
+# ===== DOCKER =====
+docker-compose.override.yml
+.dockerignore
+
+# ===== MISCELLANEOUS =====
+*.pem
+*.key
+*.crt
+*.csr
+secrets/
+credentials/
+.ssh/
+.kube/
+.aws/
+.gcloud/
+.terraform/
+.vagrant/
+
+# ===== OS =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ===== EDITOR =====
+*.sublime-project
+*.sublime-workspace
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/
+.ionide/
+
+# ===== PHP/WordPress (if applicable) =====
+wp-config.php
+wp-content/uploads/
+wp-content/cache/
+wp-content/upgrade/
+
+# ===== PYTHON =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+.venv/
+venv/
+env/
+
+# ===== RUBY =====
+.bundle/
+vendor/bundle/
+log/*.log
+tmp/**/*
+.bundler/
+*.gem
+
+# ===== JAVA =====
+*.class
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+hs_err_pid*
+replay_pid*
+
+# ===== MOBILE =====
+# React Native/Expo
+.expo/
+.expo-shared/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+web-build/
+web-report/
+
+# iOS
+ios/Pods/
+ios/build/
+ios/*.xcworkspace/xcuserdata/
+ios/*.xcodeproj/xcuserdata/
+ios/*.xcodeproj/project.xcworkspace/xcuserdata/
+DerivedData/
+
+# Android
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+android/app/release/
+*.apk
+*.aab
+*.keystore
+
+# ===== CLOUD =====
+.firebase/
+.firebaserc
+firebase-debug.log
+firestore-debug.log
+pubsub-debug.log
+storage-debug.log
+ui-debug.log
+
+# ===== SECURITY =====
+*.secret
+*.secrets
+secret.env
+credentials.json
+serviceAccountKey.json
+
+# ===== PERFORMANCE =====
+*.prof
+*.pprof
+*.trace
+*.heap
+goroutine.dump
+heap.dump
+cpu.prof
+mem.prof
+
+# ===== TYPESCRIPT =====
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# ===== NEXT.JS =====
+.next/
+out/
+next-env.d.ts
+
+# ===== VITE =====
+.vite/
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# ===== CLOUDFLARE =====
+.wrangler/
+.dev.vars
+
+# ===== VERCEL =====
+.vercel/
+.now/
+
+# ===== NPM =====
+.npm/
+.npmrc
+.npm-cache/
+
+# ===== YARN =====
+.yarn/
+.yarnrc
+.yarn-integrity
+
+# ===== PNPM =====
+.pnpm-debug.log
+.pnpm-store/
+
+# ===== GIT =====
+.git/
+.gitattributes
+*.patch
+*.diff
+

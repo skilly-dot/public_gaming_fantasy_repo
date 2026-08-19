@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: betking_postgres
+    environment:
+      POSTGRES_DB: betking_rich
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: betking_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+  adminer:
+    image: adminer:latest
+    ports:
+      - "8081:8080"
+
+
+volumes:
+  pgdata:
+  redisdata:

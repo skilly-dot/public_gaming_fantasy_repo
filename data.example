@@ -1,0 +1,13 @@
+PORT=8080
+DATABASE_URL=postgres://user:pass@host:5432/db
+MONGO_URI=
+REDIS_ADDR=
+JWT_SECRET=betking-super-secret-2026
+ENV=production
+
+# M-Pesa Daraja (optional - uses mock if empty)
+MPESA_CONSUMER_KEY=
+MPESA_CONSUMER_SECRET=
+MPESA_PASSKEY=
+MPESA_SHORTCODE=174379
+MPESA_CALLBACK_URL=https://your-domain.com/api/v1/mpesa/callback
