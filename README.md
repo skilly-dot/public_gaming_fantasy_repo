@@ -2,6 +2,7 @@
 
 ```markdown
 # FanBaze Backend
+four months 1 week 3 days and 7 hours 2 minutes to my commit...a journey so hard...but here it is..
 
 A Go-based backend server for the FanBaze fantasy gaming platform. Provides REST API endpoints, WebSocket connections for real-time updates, and comprehensive test coverage for league management, betting systems, and user operations.
 
