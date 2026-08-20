@@ -113,6 +113,13 @@ func (h *Handler) PlaceBet(w http.ResponseWriter, r *http.Request) {
     var wallet struct{ Kash, Points, Coins float64 }
     h.DB.Get(&wallet, "SELECT kash, points, coins FROM wallets WHERE user_id=$1", user.ID)
 
+    go h.PushUserState(user.ID, "bet_placed", map[string]interface{}{
+    "bet_id":     betID,
+    "total_odds": totalOdds,
+    "potential":  req.Amount * totalOdds,
+    "message":    "Bet placed successfully!",
+   })
+
     respondJSON(w, http.StatusCreated, map[string]interface{}{
         "bet_id": betID, "status": "placed",
         "total_odds": totalOdds, "potential": req.Amount * totalOdds,

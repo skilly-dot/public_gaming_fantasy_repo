@@ -1,3 +1,5 @@
+// internal/handlers/wallet_handler.go - WITH FULL DATA PUSH
+
 package handlers
 
 import (
@@ -51,6 +53,11 @@ func (h *Handler) SyncWallet(w http.ResponseWriter, r *http.Request) {
         h.DB.Exec("INSERT INTO wallets (user_id, kash, points, coins) VALUES ($1, $2, $3, $4)",
             user.ID, req.Kash, req.Points, req.Coins)
     }
+    
+    // ===== PUSH FULL USER STATE - Wallet synced =====
+    go h.PushUserState(user.ID, "wallet_updated", map[string]interface{}{
+        "message": "Wallet synced",
+    })
     
     var wallet struct{ Kash, Points, Coins float64 }
     h.DB.Get(&wallet, "SELECT kash, points, coins FROM wallets WHERE user_id=$1", user.ID)
@@ -106,6 +113,18 @@ func (h *Handler) DailyBonus(w http.ResponseWriter, r *http.Request) {
         daily_streak = $5
         WHERE user_id = $6`,
         bonusKash, bonusPoints, bonusCoins, time.Now(), streak%7, user.ID)
+    
+    // ===== PUSH FULL USER STATE - Daily bonus claimed =====
+    go h.PushUserState(user.ID, "daily_bonus_claimed", map[string]interface{}{
+        "streak": streak,
+        "day":    streak % 7,
+        "bonus": map[string]float64{
+            "kash":   bonusKash,
+            "points": bonusPoints,
+            "coins":  bonusCoins,
+        },
+        "message": "Daily bonus claimed! Come back tomorrow for more.",
+    })
     
     var wallet struct{ Kash, Points, Coins float64 }
     h.DB.Get(&wallet, "SELECT kash, points, coins FROM wallets WHERE user_id=$1", user.ID)
@@ -183,6 +202,15 @@ func (h *Handler) ExchangeCurrency(w http.ResponseWriter, r *http.Request) {
     // Update wallet
     h.DB.Exec("UPDATE wallets SET "+from+" = "+from+" - $1, "+to+" = "+to+" + $2 WHERE user_id=$3",
         req.Amount, toAmount, user.ID)
+
+    // ===== PUSH FULL USER STATE - Currency exchanged =====
+    go h.PushUserState(user.ID, "currency_exchanged", map[string]interface{}{
+        "from":     from,
+        "to":       to,
+        "amount":   req.Amount,
+        "received": toAmount,
+        "message":  "Exchange successful",
+    })
 
     var wallet struct{ Kash, Points, Coins float64 }
     h.DB.Get(&wallet, "SELECT kash, points, coins FROM wallets WHERE user_id=$1", user.ID)

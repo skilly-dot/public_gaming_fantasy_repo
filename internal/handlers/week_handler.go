@@ -1,3 +1,5 @@
+// internal/handlers/simulate_handler.go - WITH FULL DATA PUSH
+
 package handlers
 
 import (
@@ -6,7 +8,6 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	//"sort"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -52,8 +53,8 @@ func (h *Handler) StartWeek(w http.ResponseWriter, r *http.Request) {
     // Start week simulation in background
     go h.simulateWeek(leagueID, user.ID)
 
-    // Send WebSocket notification
-    h.WSHub.SendToUser(user.ID, "week_started", map[string]interface{}{
+    // ===== PUSH FULL STATE - Week started =====
+    go h.PushFullState(user.ID, leagueID, "week_started", map[string]interface{}{
         "league_id": leagueID,
         "message":   "Week started! Bets locked.",
     })
@@ -100,7 +101,6 @@ func (h *Handler) simulateWeek(leagueID string, userID string) {
     }
 }
 
-
 // updateLeagueTable updates standings after a match
 func (h *Handler) updateLeagueTable(leagueID string, homeID string, awayID string, homeScore int, awayScore int, winner string) {
     // Update home team
@@ -137,8 +137,8 @@ func (h *Handler) settleWeekBets(leagueID string, userID string) {
         AND b.status = 'LOCKED'
     `, leagueID)
     if rows == nil {
-        // Send week completed notification even if no bets
-        h.WSHub.SendToUser(userID, "week_completed", map[string]interface{}{
+        // ===== PUSH FULL STATE - Week completed (no bets) =====
+        go h.PushFullState(userID, leagueID, "week_completed", map[string]interface{}{
             "league_id": leagueID,
             "message":   "Week complete!",
         })
@@ -178,30 +178,31 @@ func (h *Handler) settleWeekBets(leagueID string, userID string) {
             h.DB.Exec(`UPDATE wallets SET kash=kash+$1, points=points+$2, coins=coins+$3 WHERE user_id=$4`,
                 netPayout, int(amount*2), int(amount*0.5), betUserID)
 
-            h.WSHub.SendToUser(betUserID, "bet_won", map[string]interface{}{
-                "bet_id": betID,
-                "payout": netPayout,
+            // ===== PUSH FULL USER STATE - Bet won =====
+            go h.PushUserState(betUserID, "bet_won", map[string]interface{}{
+                "bet_id":  betID,
+                "payout":  netPayout,
                 "message": fmt.Sprintf("You won $%.0f!", netPayout),
             })
         } else {
             h.DB.Exec(`UPDATE bets SET status='LOST', points=5, settled_at=NOW() WHERE id=$1`, betID)
             h.DB.Exec(`UPDATE wallets SET points=points+5 WHERE user_id=$1`, betUserID)
 
-            h.WSHub.SendToUser(betUserID, "bet_lost", map[string]interface{}{
-                "bet_id": betID,
+            // ===== PUSH FULL USER STATE - Bet lost =====
+            go h.PushUserState(betUserID, "bet_lost", map[string]interface{}{
+                "bet_id":  betID,
                 "message": "Better luck next time!",
             })
         }
         
-        h.WSHub.SendToUser(betUserID, "wallet_update", map[string]interface{}{})
         settledCount++
     }
 
-    // Send week completed notification
-    h.WSHub.SendToUser(userID, "week_completed", map[string]interface{}{
-        "league_id":    leagueID,
-        "settled":      settledCount,
-        "message":      fmt.Sprintf("Week complete! %d bets settled", settledCount),
+    // ===== PUSH FULL LEAGUE STATE - Week completed =====
+    go h.PushFullState(userID, leagueID, "week_completed", map[string]interface{}{
+        "league_id": leagueID,
+        "settled":   settledCount,
+        "message":   fmt.Sprintf("Week complete! %d bets settled", settledCount),
     })
 }
 
@@ -243,7 +244,8 @@ func (h *Handler) NextWeek(w http.ResponseWriter, r *http.Request) {
     if dayNumber >= totalWeeks {
         h.DB.Exec("UPDATE leagues SET status='COMPLETED' WHERE id=$1", leagueID)
         
-        h.WSHub.SendToUser(user.ID, "league_completed", map[string]interface{}{
+        // ===== PUSH FULL STATE - League completed =====
+        go h.PushFullState(user.ID, leagueID, "league_completed", map[string]interface{}{
             "league_id": leagueID,
             "message":   "League completed!",
         })
@@ -266,7 +268,8 @@ func (h *Handler) NextWeek(w http.ResponseWriter, r *http.Request) {
     // Update both day_number and current_week
     h.DB.Exec("UPDATE leagues SET day_number=$1, current_week=$1 WHERE id=$2", nextWeek, leagueID)
 
-    h.WSHub.SendToUser(user.ID, "week_advanced", map[string]interface{}{
+    // ===== PUSH FULL STATE - Week advanced =====
+    go h.PushFullState(user.ID, leagueID, "week_advanced", map[string]interface{}{
         "league_id": leagueID,
         "week":      nextWeek,
         "message":   fmt.Sprintf("Week %d ready! Place your bets.", nextWeek),
@@ -334,8 +337,6 @@ func (h *Handler) getCurrentWeek(leagueID string) int {
     }
     return week
 }
-
-
 
 // GetTopScorers returns top scorers for a league
 func (h *Handler) GetTopScorers(w http.ResponseWriter, r *http.Request) {
@@ -467,16 +468,16 @@ func (h *Handler) simulateMatch(leagueID string, userID string, match struct {
     // Update league table
     h.updateLeagueTable(leagueID, match.HomeID, match.AwayID, homeScore, awayScore, winner)
 
-    // WebSocket
-    h.WSHub.SendToUser(userID, "match_completed", map[string]interface{}{
-        "match_id": match.FixtureID,
-        "home_team": match.HomeName,
-        "away_team": match.AwayName,
+    // ===== PUSH FULL LEAGUE STATE - Match completed =====
+    go h.PushFullState(userID, leagueID, "match_completed", map[string]interface{}{
+        "match_id":   match.FixtureID,
+        "home_team":  match.HomeName,
+        "away_team":  match.AwayName,
         "home_score": homeScore,
         "away_score": awayScore,
-        "winner": winner,
-        "goals": goals,
-        "stats": stats,
+        "winner":     winner,
+        "goals":      goals,
+        "stats":      stats,
     })
 
     fmt.Printf("Match: %s %d-%d %s\n", match.HomeName, homeScore, awayScore, match.AwayName)

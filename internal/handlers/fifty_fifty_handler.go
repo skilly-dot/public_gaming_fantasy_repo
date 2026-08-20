@@ -1,4 +1,5 @@
-// internal/handlers/fifty_fifty_handler.go
+// internal/handlers/fifty_fifty_handler.go - WITH FULL DATA PUSH
+
 package handlers
 
 import (
@@ -12,8 +13,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// internal/handlers/fifty_fifty_handler.go - With Custom Odds
-
+// AdminCreateFiftyFifty - Creates a new 50-50 bet
 func (h *Handler) AdminCreateFiftyFifty(w http.ResponseWriter, r *http.Request) {
     user := getUserFromContext(r.Context())
     
@@ -70,9 +70,14 @@ func (h *Handler) AdminCreateFiftyFifty(w http.ResponseWriter, r *http.Request) 
         return
     }
     
-    h.WSHub.SendToAll("fifty_fifty_created", map[string]interface{}{
-        "bet_id": betID,
-        "title":  req.Title,
+    // ===== NOTIFY ALL USERS - New 50-50 bet available =====
+    go h.WSHub.SendToAll("fifty_fifty_created", map[string]interface{}{
+        "bet_id":      betID,
+        "title":       req.Title,
+        "description": req.Description,
+        "yes_odds":    req.YesOdds,
+        "no_odds":     req.NoOdds,
+        "message":     fmt.Sprintf("New 50-50 bet: %s", req.Title),
     })
     
     respondJSON(w, http.StatusCreated, map[string]interface{}{
@@ -82,6 +87,7 @@ func (h *Handler) AdminCreateFiftyFifty(w http.ResponseWriter, r *http.Request) 
         "no_odds":  req.NoOdds,
     })
 }
+
 // PUT /api/v1/admin/fifty-fifty/{betID}/lock
 func (h *Handler) AdminLockFiftyFifty(w http.ResponseWriter, r *http.Request) {
     betID := chi.URLParam(r, "betID")
@@ -99,10 +105,13 @@ func (h *Handler) AdminLockFiftyFifty(w http.ResponseWriter, r *http.Request) {
     
     h.DB.Exec("UPDATE fifty_fifty_bets SET status='LOCKED' WHERE id=$1", betID)
     
+    // ===== NOTIFY ALL USERS - Bet locked =====
+    go h.WSHub.SendToAll("fifty_fifty_locked", map[string]interface{}{
+        "bet_id":  betID,
+        "message": "A 50-50 bet has been locked",
+    })
+    
     respondJSON(w, http.StatusOK, map[string]string{"status": "locked"})
-    h.WSHub.SendToAll("fifty_fifty_locked", map[string]interface{}{
-    "bet_id": betID,
-})
 }
 
 // PUT /api/v1/admin/fifty-fifty/{betID}/settle
@@ -127,20 +136,14 @@ func (h *Handler) AdminSettleFiftyFifty(w http.ResponseWriter, r *http.Request) 
     // Settle all user bets - ONE click settles everything
     h.settleFiftyFiftyBets(betID, req.Result)
     
-    respondJSON(w, http.StatusOK, map[string]string{"status": "settled"})
-    h.WSHub.SendToAll("fifty_fifty_settled", map[string]interface{}{
-    "bet_id": betID,
-    "result": req.Result,
-})
-
-rows, _ := h.DB.Query("SELECT DISTINCT user_id FROM user_fifty_fifty_bets WHERE fifty_fifty_id=$1 AND status='PENDING'", betID)
-for rows.Next() {
-    var userID string
-    rows.Scan(&userID)
-    h.WSHub.SendToUser(userID, "wallet_update", map[string]interface{}{
-        "message": "50-50 bet settled",
+    // ===== NOTIFY ALL USERS - Bet settled =====
+    go h.WSHub.SendToAll("fifty_fifty_settled", map[string]interface{}{
+        "bet_id":  betID,
+        "result":  req.Result,
+        "message": fmt.Sprintf("50-50 bet settled: %s", req.Result),
     })
-}
+    
+    respondJSON(w, http.StatusOK, map[string]string{"status": "settled"})
 }
 
 // DELETE /api/v1/admin/fifty-fifty/{betID}
@@ -150,6 +153,12 @@ func (h *Handler) AdminDeleteFiftyFifty(w http.ResponseWriter, r *http.Request) 
     h.DB.Exec(`UPDATE fifty_fifty_bets 
                SET status='DELETED', deleted_at=NOW() 
                WHERE id=$1 AND status != 'DELETED'`, betID)
+    
+    // ===== NOTIFY ALL USERS - Bet deleted =====
+    go h.WSHub.SendToAll("fifty_fifty_deleted", map[string]interface{}{
+        "bet_id":  betID,
+        "message": "A 50-50 bet has been removed",
+    })
     
     respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -287,6 +296,16 @@ func (h *Handler) PlaceFiftyFiftyBet(w http.ResponseWriter, r *http.Request) {
         return
     }
     
+    // ===== PUSH FULL USER STATE - 50-50 bet placed =====
+    go h.PushUserState(user.ID, "fifty_fifty_bet_placed", map[string]interface{}{
+        "bet_id":        betID,
+        "fifty_fifty_id": req.FiftyFiftyID,
+        "prediction":    req.Prediction,
+        "odds":          odds,
+        "potential_win": potentialWin,
+        "message":       "50-50 bet placed successfully!",
+    })
+    
     respondJSON(w, http.StatusCreated, map[string]interface{}{
         "status":        "placed",
         "bet_id":        betID,
@@ -368,8 +387,7 @@ func (h *Handler) GetFiftyFiftyHistory(w http.ResponseWriter, r *http.Request) {
     respondJSON(w, http.StatusOK, bets)
 }
 
-
-
+// settleFiftyFiftyBets - Settles all bets on a 50-50 proposition
 func (h *Handler) settleFiftyFiftyBets(betID string, result string) {
     // ONE query settles ALL bets on this proposition
     rows, _ := h.DB.Query(`
@@ -384,21 +402,34 @@ func (h *Handler) settleFiftyFiftyBets(betID string, result string) {
     defer rows.Close()
     
     for rows.Next() {
-        var betID, userID, prediction string
+        var userBetID, userID, prediction string
         var amount, potentialWin float64
-        rows.Scan(&betID, &userID, &prediction, &amount, &potentialWin)
+        rows.Scan(&userBetID, &userID, &prediction, &amount, &potentialWin)
         
         if prediction == result {
             // Winner - pay out the pre-calculated potential win
             h.DB.Exec(`UPDATE user_fifty_fifty_bets 
                        SET status='WON', payout=$1, settled_at=NOW() 
-                       WHERE id=$2`, potentialWin, betID)
+                       WHERE id=$2`, potentialWin, userBetID)
             h.DB.Exec("UPDATE wallets SET kash = kash + $1 WHERE user_id = $2", potentialWin, userID)
+            
+            // ===== PUSH FULL USER STATE - 50-50 bet won =====
+            go h.PushUserState(userID, "fifty_fifty_won", map[string]interface{}{
+                "bet_id":  userBetID,
+                "payout":  potentialWin,
+                "message": fmt.Sprintf("50-50 bet won! +$%.2f", potentialWin),
+            })
         } else {
             // Loser
             h.DB.Exec(`UPDATE user_fifty_fifty_bets 
                        SET status='LOST', settled_at=NOW() 
-                       WHERE id=$1`, betID)
+                       WHERE id=$1`, userBetID)
+            
+            // ===== PUSH FULL USER STATE - 50-50 bet lost =====
+            go h.PushUserState(userID, "fifty_fifty_lost", map[string]interface{}{
+                "bet_id":  userBetID,
+                "message": "50-50 bet lost",
+            })
         }
     }
 }

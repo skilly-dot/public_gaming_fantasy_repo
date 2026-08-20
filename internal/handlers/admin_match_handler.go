@@ -1,4 +1,5 @@
-// internal/handlers/admin_match_handler.go
+// internal/handlers/admin_match_handler.go - WITH FULL DATA PUSH
+
 package handlers
 
 import (
@@ -69,16 +70,21 @@ func (h *Handler) AdminCreateMatchBet(w http.ResponseWriter, r *http.Request) {
         matchIDs = append(matchIDs, matchID)
     }
     
+    // ===== NOTIFY ALL USERS - New admin bet available =====
+    go h.WSHub.SendToAll("admin_bet_created", map[string]interface{}{
+        "bet_id":      betID,
+        "title":       req.Title,
+        "description": req.Description,
+        "match_count": len(req.Matches),
+        "message":     fmt.Sprintf("New bet available: %s", req.Title),
+    })
+    
     respondJSON(w, http.StatusCreated, map[string]interface{}{
         "status":    "created",
         "bet_id":    betID,
         "matches":   len(req.Matches),
         "match_ids": matchIDs,
     })
-    h.WSHub.SendToAll("admin_bet_created", map[string]interface{}{
-    "bet_id": betID,
-    "title":  req.Title,
-})
 }
 
 // DELETE /api/v1/admin/match-bets/{betID}
@@ -93,6 +99,12 @@ func (h *Handler) AdminDeleteMatchBet(w http.ResponseWriter, r *http.Request) {
         respondError(w, http.StatusNotFound, "Bet not found")
         return
     }
+    
+    // ===== NOTIFY ALL USERS - Bet deleted =====
+    go h.WSHub.SendToAll("admin_bet_deleted", map[string]interface{}{
+        "bet_id":  betID,
+        "message": "A bet has been removed",
+    })
     
     respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -116,10 +128,13 @@ func (h *Handler) AdminLockMatchBet(w http.ResponseWriter, r *http.Request) {
     h.DB.Exec("UPDATE admin_match_bets SET status='LOCKED', updated_at=NOW() WHERE id=$1", betID)
     h.DB.Exec("UPDATE admin_matches SET status='LOCKED' WHERE admin_bet_id=$1 AND status='SCHEDULED'", betID)
     
+    // ===== NOTIFY ALL USERS - Bet locked =====
+    go h.WSHub.SendToAll("admin_bet_locked", map[string]interface{}{
+        "bet_id":  betID,
+        "message": "A bet has been locked",
+    })
+    
     respondJSON(w, http.StatusOK, map[string]string{"status": "locked"})
-    h.WSHub.SendToAll("admin_bet_locked", map[string]interface{}{
-    "bet_id": betID,
-})
 }
 
 // POST /api/v1/admin/matches/{matchID}/settle
@@ -155,23 +170,19 @@ func (h *Handler) AdminSettleMatch(w http.ResponseWriter, r *http.Request) {
     // Settle all user bets containing this match
     go h.settleAdminMatchBets(matchID, result)
     
+    // ===== NOTIFY ALL USERS - Match settled =====
+    go h.WSHub.SendToAll("admin_match_settled", map[string]interface{}{
+        "match_id":   matchID,
+        "result":     result,
+        "home_score": req.HomeScore,
+        "away_score": req.AwayScore,
+        "message":    fmt.Sprintf("Match settled: %d-%d (%s)", req.HomeScore, req.AwayScore, result),
+    })
+    
     respondJSON(w, http.StatusOK, map[string]interface{}{
         "status": "settled",
         "result": result,
     })
-    h.WSHub.SendToAll("admin_bet_settled", map[string]interface{}{
-    "match_id": matchID,
-    "result":   result,
-  })
-
- rows, _ := h.DB.Query("SELECT DISTINCT user_id FROM user_admin_match_bets WHERE match_picks::text LIKE $1", "%"+matchID+"%")
- for rows.Next() {
-    var userID string
-    rows.Scan(&userID)
-    h.WSHub.SendToUser(userID, "wallet_update", map[string]interface{}{
-        "message": "Admin bet settled",
-    })
-}
 }
 
 // GET /api/v1/admin/match-bets (Admin sees all their bets)
@@ -356,6 +367,15 @@ func (h *Handler) PlaceAdminMatchBet(w http.ResponseWriter, r *http.Request) {
         return
     }
     
+    // ===== PUSH FULL USER STATE - Admin bet placed =====
+    go h.PushUserState(user.ID, "admin_bet_placed", map[string]interface{}{
+        "bet_id":        betID,
+        "total_odds":    totalOdds,
+        "potential_win": potentialWin,
+        "stake":         req.Amount,
+        "message":       "Admin bet placed successfully!",
+    })
+    
     respondJSON(w, http.StatusCreated, map[string]interface{}{
         "status":        "placed",
         "bet_id":        betID,
@@ -496,14 +516,28 @@ func (h *Handler) settleAdminMatchBets(matchID string, result string) {
                            SET status='WON', payout=$1, settled_at=NOW() 
                            WHERE id=$2`, potentialWin, betID)
                 h.DB.Exec("UPDATE wallets SET kash = kash + $1 WHERE user_id = $2", potentialWin, userID)
+                
+                // ===== PUSH FULL USER STATE - Admin bet won =====
+                go h.PushUserState(userID, "admin_bet_won", map[string]interface{}{
+                    "bet_id":  betID,
+                    "payout":  potentialWin,
+                    "message": fmt.Sprintf("Admin bet won! +$%.2f", potentialWin),
+                })
             } else {
                 h.DB.Exec(`UPDATE user_admin_match_bets 
                            SET status='LOST', settled_at=NOW() 
                            WHERE id=$1`, betID)
+                
+                // ===== PUSH FULL USER STATE - Admin bet lost =====
+                go h.PushUserState(userID, "admin_bet_lost", map[string]interface{}{
+                    "bet_id":  betID,
+                    "message": "Admin bet lost",
+                })
             }
         }
     }
 }
+
 // GET /api/v1/admin/match-bets/{betID}/matches
 // Returns ALL matches for a specific bet (admin only - for settlement)
 func (h *Handler) AdminGetBetMatches(w http.ResponseWriter, r *http.Request) {

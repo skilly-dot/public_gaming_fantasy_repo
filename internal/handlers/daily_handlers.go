@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5" 
 	"github.com/google/uuid"
 )
 
@@ -154,32 +154,72 @@ func (h *Handler) getCurrentTable(leagueID string) []map[string]interface{} {
     return table
 }
 
-// getWeekOdds returns odds for a week
+// In daily_handler.go - Update getWeekOdds
+
 func (h *Handler) getWeekOdds(leagueID string, week int) []map[string]interface{} {
-    rows, _ := h.DB.Query(`
-        SELECT mo.fixture_id, mo.home_win, mo.draw, mo.away_win,
-               mo.home_odds, mo.draw_odds, mo.away_odds,
-               t1.name as home_team, t2.name as away_team
-        FROM match_odds mo
-        JOIN fixtures f ON mo.fixture_id = f.id
+    rows, err := h.DB.Query(`
+        SELECT 
+            f.id as fixture_id,
+            f.week_number,
+            f.kickoff_time,
+            t1.name as home_team,
+            t2.name as away_team,
+            mo.home_win,
+            mo.draw,
+            mo.away_win,
+            mo.home_odds,
+            mo.draw_odds,
+            mo.away_odds
+        FROM fixtures f
         JOIN teams t1 ON f.home_team_id = t1.id
         JOIN teams t2 ON f.away_team_id = t2.id
-        WHERE mo.league_id = $1 AND f.week_number = $2
+        LEFT JOIN match_odds mo ON f.id = mo.fixture_id
+        WHERE f.league_id = $1 AND f.week_number = $2
+        ORDER BY f.id
     `, leagueID, week)
+    
+    if err != nil {
+        return []map[string]interface{}{}
+    }
     defer rows.Close()
     
     var odds []map[string]interface{}
     for rows.Next() {
-        var fixtureID, homeTeam, awayTeam string
+        var fixtureID string
+        var weekNum int
+        var kickoffTime int64
+        var homeTeam, awayTeam string
         var homeWin, draw, awayWin, homeOdds, drawOdds, awayOdds float64
-        rows.Scan(&fixtureID, &homeWin, &draw, &awayWin, &homeOdds, &drawOdds, &awayOdds, &homeTeam, &awayTeam)
+        
+        err := rows.Scan(&fixtureID, &weekNum, &kickoffTime, &homeTeam, &awayTeam,
+            &homeWin, &draw, &awayWin, &homeOdds, &drawOdds, &awayOdds)
+        
+        if err != nil {
+            continue
+        }
+        
         odds = append(odds, map[string]interface{}{
-            "fixture_id": fixtureID, "home_team": homeTeam, "away_team": awayTeam,
-            "probability": map[string]float64{"home": homeWin, "draw": draw, "away": awayWin},
-            "odds": map[string]float64{"home": homeOdds, "draw": drawOdds, "away": awayOdds},
+            "fixture_id":   fixtureID,
+            "week":         weekNum,
+            "kickoff_time": kickoffTime,
+            "home_team":    homeTeam,
+            "away_team":    awayTeam,
+            "probability": map[string]float64{
+                "home": homeWin,
+                "draw": draw,
+                "away": awayWin,
+            },
+            "odds": map[string]float64{
+                "home": homeOdds,
+                "draw": drawOdds,
+                "away": awayOdds,
+            },
         })
     }
-    if odds == nil { odds = []map[string]interface{}{} }
+    
+    if odds == nil {
+        odds = []map[string]interface{}{}
+    }
     return odds
 }
 

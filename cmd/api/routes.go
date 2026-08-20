@@ -26,7 +26,8 @@ func setupRoutes(r chi.Router, h *handlers.Handler) {
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   getAllowedOrigins(),
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-App-Key"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-App-Key", "If-None-Match"},
+		ExposedHeaders:   []string{"ETag"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
@@ -55,6 +56,9 @@ func setupRoutes(r chi.Router, h *handlers.Handler) {
 		// ===== PROTECTED ROUTES =====
 		r.Group(func(r chi.Router) {
 			r.Use(mw.AuthMiddleware(h.DB, h.Redis))
+
+			// ===== STATE ENDPOINT (NEW) =====
+			r.Get("/state", h.GetState)
 
 			// ===== ADMIN ROUTES =====
 			r.Group(func(r chi.Router) {
@@ -110,14 +114,13 @@ func setupRoutes(r chi.Router, h *handlers.Handler) {
 			r.Get("/leagues/{leagueID}/fixtures", h.GetLeagueFixtures)
 			r.Post("/leagues/{leagueID}/start-week", h.StartWeek)
 			r.Post("/leagues/{leagueID}/next-week", h.NextWeek)
-						// cmd/api/routes.go
 			r.Post("/leagues/{leagueID}/winner-bet", h.PlaceLeagueWinnerBet)
 			r.Post("/leagues/{leagueID}/finish", h.FinishLeague)
 			r.Post("/leagues/{leagueID}/forfeit", h.ForfeitLeague)
 
-            r.Post("/leagues/{leagueID}/quick-match/generate", h.GenerateQuickMatch)
-            r.Post("/leagues/{leagueID}/quick-match/{quickMatchID}/bet", h.BetOnQuickMatch)
-            r.Post("/leagues/{leagueID}/quick-match/{quickMatchID}/start", h.StartQuickMatch)
+			r.Post("/leagues/{leagueID}/quick-match/generate", h.GenerateQuickMatch)
+			r.Post("/leagues/{leagueID}/quick-match/{quickMatchID}/bet", h.BetOnQuickMatch)
+			r.Post("/leagues/{leagueID}/quick-match/{quickMatchID}/start", h.StartQuickMatch)
 
 			// ===== BETTING =====
 			r.Group(func(r chi.Router) {

@@ -1,4 +1,4 @@
-// internal/handlers/quick_match_handler.go
+// internal/handlers/quick_match_handler.go - WITH FULL DATA PUSH
 
 package handlers
 
@@ -76,6 +76,18 @@ func (h *Handler) GenerateQuickMatch(w http.ResponseWriter, r *http.Request) {
     h.DB.Exec(`INSERT INTO quick_matches (id, league_id, user_id, home_team_id, away_team_id, home_odds, draw_odds, away_odds, status)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING')`,
         quickMatchID, leagueID, user.ID, homeTeam.ID, awayTeam.ID, homeOdds, drawOdds, awayOdds)
+    
+    // ===== PUSH USER STATE - Quick match generated =====
+    go h.PushUserState(user.ID, "quick_match_generated", map[string]interface{}{
+        "quick_match_id": quickMatchID,
+        "home_team":      homeTeam,
+        "away_team":      awayTeam,
+        "odds": map[string]float64{
+            "home": homeOdds,
+            "draw": drawOdds,
+            "away": awayOdds,
+        },
+    })
     
     respondJSON(w, http.StatusOK, map[string]interface{}{
         "quick_match_id": quickMatchID,
@@ -162,6 +174,14 @@ func (h *Handler) BetOnQuickMatch(w http.ResponseWriter, r *http.Request) {
     
     h.DB.Exec("UPDATE quick_matches SET status='BET_PLACED' WHERE id=$1", quickMatchID)
     
+    // ===== PUSH FULL USER STATE - Quick match bet placed =====
+    go h.PushUserState(user.ID, "quick_match_bet_placed", map[string]interface{}{
+        "bet_id":        betID,
+        "quick_match_id": quickMatchID,
+        "odds":          req.Odds,
+        "potential_win": req.Amount * req.Odds * 0.88,
+    })
+    
     respondJSON(w, http.StatusCreated, map[string]interface{}{
         "status": "bet_placed",
         "bet_id": betID,
@@ -224,15 +244,21 @@ func (h *Handler) StartQuickMatch(w http.ResponseWriter, r *http.Request) {
                 h.DB.Exec("UPDATE bets SET status='WON', payout=$1, settled_at=NOW() WHERE id=$2", payout, betID)
                 h.DB.Exec("UPDATE wallets SET kash = kash + $1 WHERE user_id = $2", payout, user.ID)
                 
-                h.WSHub.SendToUser(user.ID, "quick_match_won", map[string]interface{}{
-                    "message": fmt.Sprintf("Quick match WON! +$%.2f", payout),
-                    "payout": payout,
+                // ===== PUSH FULL USER STATE - Quick match won =====
+                go h.PushUserState(user.ID, "quick_match_won", map[string]interface{}{
+                    "bet_id":         betID,
+                    "quick_match_id": quickMatchID,
+                    "payout":         payout,
+                    "message":        fmt.Sprintf("Quick match WON! +$%.2f", payout),
                 })
             } else {
                 h.DB.Exec("UPDATE bets SET status='LOST', settled_at=NOW() WHERE id=$1", betID)
                 
-                h.WSHub.SendToUser(user.ID, "quick_match_lost", map[string]interface{}{
-                    "message": "Quick match lost",
+                // ===== PUSH FULL USER STATE - Quick match lost =====
+                go h.PushUserState(user.ID, "quick_match_lost", map[string]interface{}{
+                    "bet_id":         betID,
+                    "quick_match_id": quickMatchID,
+                    "message":        "Quick match lost",
                 })
             }
         }
@@ -241,14 +267,15 @@ func (h *Handler) StartQuickMatch(w http.ResponseWriter, r *http.Request) {
     h.DB.Exec("UPDATE quick_matches SET status='COMPLETED', home_score=$1, away_score=$2, winner=$3 WHERE id=$4", 
         homeScore, awayScore, winner, quickMatchID)
     
-    h.WSHub.SendToUser(user.ID, "quick_match_completed", map[string]interface{}{
-        "home_team": homeName,
-        "away_team": awayName,
-        "home_score": homeScore,
-        "away_score": awayScore,
-        "winner": winner,
+    // ===== PUSH FULL STATE - Quick match completed =====
+    go h.PushUserState(user.ID, "quick_match_completed", map[string]interface{}{
+        "quick_match_id": quickMatchID,
+        "home_team":      homeName,
+        "away_team":      awayName,
+        "home_score":     homeScore,
+        "away_score":     awayScore,
+        "winner":         winner,
     })
-    h.WSHub.SendToUser(user.ID, "wallet_update", map[string]interface{}{})
     
     respondJSON(w, http.StatusOK, map[string]interface{}{
         "status": "completed",

@@ -1,8 +1,7 @@
-// internal/handlers/league_handler.go - FULL using UltimateGenerator
+
 package handlers
 
 import (
-	//"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -62,11 +61,17 @@ func (h *Handler) FinishLeague(w http.ResponseWriter, r *http.Request) {
     // Validate winner bet
     h.validateWinnerBet(leagueID, user.ID)
     
+    // Get completion data BEFORE deleting
+    completionData := h.getLeagueCompletionData(leagueID)
+    
     // Delete league
     h.deleteLeagueData(leagueID)
     
-    h.WSHub.SendToUser(user.ID, "league_finished", map[string]interface{}{
-        "message": "League finished! $1000 prize awarded!",
+    // ===== PUSH FULL USER STATE - League finished =====
+    go h.PushUserState(user.ID, "league_finished", map[string]interface{}{
+        "prize":      1000,
+        "completion": completionData,
+        "message":    "League finished! $1000 prize awarded!",
     })
     
     respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -75,63 +80,197 @@ func (h *Handler) FinishLeague(w http.ResponseWriter, r *http.Request) {
     })
 }
 
-
-
-func (h *Handler) GetAvailableLeagues(w http.ResponseWriter, r *http.Request) {
-    rows, _ := h.DB.Query(`
-        SELECT l.id, l.name, l.type, l.difficulty, l.total_weeks,
-               COUNT(ul.user_id) as user_count
-        FROM leagues l
-        LEFT JOIN user_leagues ul ON l.id = ul.league_id
-        WHERE l.status = 'ACTIVE'
-        GROUP BY l.id
-        ORDER BY user_count DESC, l.name
-    `)
-    defer rows.Close()
-    
-    var leagues []map[string]interface{}
-    for rows.Next() {
-        var id, name, ltype, diff string
-        var weeks, count int
-        rows.Scan(&id, &name, &ltype, &diff, &weeks, &count)
-        leagues = append(leagues, map[string]interface{}{
-            "id": id, "name": name, "type": ltype,
-            "difficulty": diff, "total_weeks": weeks,
-            "user_count": count,
-            "is_empty": count == 0,
-            "is_popular": count >= 5,
-        })
-    }
-    if leagues == nil { leagues = []map[string]interface{}{} }
-    respondJSON(w, http.StatusOK, leagues)
-}
-
-func (h *Handler) GetMyLeagues(w http.ResponseWriter, r *http.Request) {
+// ForfeitLeague with transaction
+func (h *Handler) ForfeitLeague(w http.ResponseWriter, r *http.Request) {
     user := getUserFromContext(r.Context())
-    rows, _ := h.DB.Query(`
-        SELECT l.id, l.name, l.type, l.difficulty, l.total_weeks, l.status, l.day_number
-        FROM leagues l
-        WHERE l.user_id = $1
-        ORDER BY l.created_at DESC
-    `, user.ID)
-    defer rows.Close()
+    leagueID := chi.URLParam(r, "leagueID")
     
-    var leagues []map[string]interface{}
-    for rows.Next() {
-        var id, name, ltype, diff, status string
-        var weeks, day int
-        rows.Scan(&id, &name, &ltype, &diff, &weeks, &status, &day)
-        leagues = append(leagues, map[string]interface{}{
-            "id": id, "name": name, "type": ltype,
-            "difficulty": diff, "total_weeks": weeks,
-            "status": status, "day_number": day,
-        })
+    if user == nil {
+        respondError(w, http.StatusUnauthorized, "Unauthorized")
+        return
     }
-    if leagues == nil { leagues = []map[string]interface{}{} }
-    respondJSON(w, http.StatusOK, leagues)
+    
+    // Check if league exists
+    var leagueUserID string
+    err := h.DB.QueryRow("SELECT user_id FROM leagues WHERE id=$1", leagueID).Scan(&leagueUserID)
+    
+    if err != nil {
+        respondJSON(w, http.StatusOK, map[string]interface{}{
+            "status": "already_deleted",
+            "message": "League already forfeited",
+        })
+        return
+    }
+    
+    if leagueUserID != user.ID {
+        respondError(w, http.StatusForbidden, "Not your league")
+        return
+    }
+    
+    // Start transaction
+    tx, err := h.DB.Beginx()
+    if err != nil {
+        respondError(w, http.StatusInternalServerError, "Transaction error")
+        return
+    }
+    defer tx.Rollback()
+    
+    // Check wallet within transaction
+    var kash float64
+    err = tx.QueryRow("SELECT kash FROM wallets WHERE user_id=$1", user.ID).Scan(&kash)
+    if err != nil {
+        respondError(w, http.StatusBadRequest, "Wallet not found")
+        return
+    }
+    
+    if kash < 100 {
+        respondError(w, http.StatusBadRequest, "Need $100 to forfeit")
+        return
+    }
+    
+    // Deduct penalty
+    tx.Exec("UPDATE wallets SET kash = kash - 100 WHERE user_id = $1", user.ID)
+    
+    // Delete all data in transaction
+    h.deleteLeagueDataTx(tx, leagueID)
+    
+    // Commit
+    if err := tx.Commit(); err != nil {
+        respondError(w, http.StatusInternalServerError, "Failed to commit")
+        return
+    }
+    
+    // ===== PUSH FULL USER STATE - League forfeited =====
+    go h.PushUserState(user.ID, "league_forfeited", map[string]interface{}{
+        "penalty": 100,
+        "message": "League forfeited. $100 penalty deducted.",
+    })
+    
+    respondJSON(w, http.StatusOK, map[string]interface{}{
+        "status": "forfeited",
+        "penalty": 100,
+    })
 }
-// internal/handlers/league_handler.go
 
+// PlaceLeagueWinnerBet
+func (h *Handler) PlaceLeagueWinnerBet(w http.ResponseWriter, r *http.Request) {
+    user := getUserFromContext(r.Context())
+    leagueID := chi.URLParam(r, "leagueID")
+    
+    var req struct {
+        TeamID      string `json:"team_id"`
+        PointsRange string `json:"points_range"`
+    }
+    json.NewDecoder(r.Body).Decode(&req)
+    
+    // Verify league belongs to user and is in week 1 (not started)
+    var leagueUserID string
+    var dayNumber int
+    h.DB.QueryRow("SELECT user_id, day_number FROM leagues WHERE id=$1", leagueID).Scan(&leagueUserID, &dayNumber)
+    
+    if leagueUserID != user.ID {
+        respondError(w, http.StatusForbidden, "League not found")
+        return
+    }
+    
+    if dayNumber > 1 {
+        respondError(w, http.StatusBadRequest, "Winner bet only available before week 1 starts")
+        return
+    }
+    
+    // Check if already placed
+    var count int
+    h.DB.QueryRow("SELECT COUNT(*) FROM bets WHERE league_id=$1 AND user_id=$2 AND is_winner_bet=true", leagueID, user.ID).Scan(&count)
+    if count > 0 {
+        respondError(w, http.StatusBadRequest, "Already placed winner bet")
+        return
+    }
+    
+    // Get team count for prize calculation
+    var teamCount int
+    h.DB.QueryRow("SELECT COUNT(*) FROM teams WHERE league_id=$1", leagueID).Scan(&teamCount)
+    
+    // Prize: 5=$10K, 6=$50K, 7=$100K, 8=$150K, 10=$250K, 15=$500K, 20=$1M
+    prize := calculateWinnerBetPrize(teamCount)
+    
+    // Create bet with special flag
+    betID := "WBL_" + uuid.New().String()[:12]
+    betsJSON, _ := json.Marshal([]map[string]interface{}{
+        {
+            "fixture_id": leagueID,
+            "prediction": req.TeamID,
+            "points_range": req.PointsRange,
+        },
+    })
+    
+    h.DB.Exec(`INSERT INTO bets (id, user_id, league_id, week, bets, amount, total_odds, is_custom, status, is_winner_bet, placed_at)
+               VALUES ($1, $2, $3, 0, $4, 0, 0, false, 'PENDING', true, NOW())`,
+        betID, user.ID, leagueID, betsJSON)
+    
+    // ===== PUSH FULL USER STATE - Winner bet placed =====
+    go h.PushUserState(user.ID, "winner_bet_placed", map[string]interface{}{
+        "bet_id":  betID,
+        "prize":   prize,
+        "message": fmt.Sprintf("Winner bet placed! Win $%v if correct!", prize),
+    })
+    
+    respondJSON(w, http.StatusCreated, map[string]interface{}{
+        "status": "placed",
+        "bet_id": betID,
+        "prize": prize,
+        "message": fmt.Sprintf("Winner bet placed! Win $%v if correct!", prize),
+    })
+}
+
+// validateWinnerBet - Settles winner bet
+func (h *Handler) validateWinnerBet(leagueID string, userID string) {
+    // Get winner bet
+    var betID, betsStr string
+    h.DB.QueryRow("SELECT id, bets::text FROM bets WHERE league_id=$1 AND user_id=$2 AND is_winner_bet=true AND status='PENDING'", 
+        leagueID, userID).Scan(&betID, &betsStr)
+    
+    if betID == "" {
+        return // No winner bet
+    }
+    
+    // Get actual league winner from table
+    var winnerTeamID string
+    h.DB.QueryRow("SELECT team_id FROM league_table WHERE league_id=$1 ORDER BY points DESC LIMIT 1", leagueID).Scan(&winnerTeamID)
+    
+    var predictions []map[string]interface{}
+    json.Unmarshal([]byte(betsStr), &predictions)
+    
+    if len(predictions) > 0 {
+        predictedTeamID := predictions[0]["prediction"].(string)
+        
+        if predictedTeamID == winnerTeamID {
+            // WINNER!
+            var teamCount int
+            h.DB.QueryRow("SELECT COUNT(*) FROM teams WHERE league_id=$1", leagueID).Scan(&teamCount)
+            prize := calculateWinnerBetPrize(teamCount)
+            
+            h.DB.Exec("UPDATE bets SET status='WON', payout=$1, settled_at=NOW() WHERE id=$2", prize, betID)
+            h.DB.Exec("UPDATE wallets SET kash = kash + $1 WHERE user_id = $2", prize, userID)
+            
+            // ===== PUSH FULL USER STATE - Winner bet won =====
+            go h.PushUserState(userID, "winner_bet_won", map[string]interface{}{
+                "bet_id":  betID,
+                "prize":   prize,
+                "message": fmt.Sprintf("Winner bet correct! You won $%.0f!", prize),
+            })
+        } else {
+            h.DB.Exec("UPDATE bets SET status='LOST', settled_at=NOW() WHERE id=$1", betID)
+            
+            // ===== PUSH FULL USER STATE - Winner bet lost =====
+            go h.PushUserState(userID, "winner_bet_lost", map[string]interface{}{
+                "bet_id":  betID,
+                "message": "Winner bet incorrect",
+            })
+        }
+    }
+}
+
+// CreateLeague - With full state push
 func (h *Handler) CreateLeague(w http.ResponseWriter, r *http.Request) {
     user := getUserFromContext(r.Context())
     
@@ -163,19 +302,13 @@ func (h *Handler) CreateLeague(w http.ResponseWriter, r *http.Request) {
         req.TeamCount = 20
     }
     if req.TeamCount == 0 {
-        req.TeamCount = 10 // Default
+        req.TeamCount = 10
     }
     
     // ===== VALIDATE DIFFICULTY =====
     validDifficulties := map[string]bool{
-        "BEGINNER":     true,
-        "EASY":         true,
-        "NORMAL":       true,
-        "CHALLENGING":  true,
-        "HARD":         true,
-        "EXPERT":       true,
-        "MASTER":       true,
-        "GRANDMASTER":  true,
+        "BEGINNER": true, "EASY": true, "NORMAL": true, "CHALLENGING": true,
+        "HARD": true, "EXPERT": true, "MASTER": true, "GRANDMASTER": true,
     }
     if !validDifficulties[req.Difficulty] {
         req.Difficulty = "NORMAL"
@@ -310,6 +443,17 @@ func (h *Handler) CreateLeague(w http.ResponseWriter, r *http.Request) {
     var updatedWallet struct{ Kash, Points, Coins float64 }
     h.DB.Get(&updatedWallet, "SELECT kash, points, coins FROM wallets WHERE user_id=$1", user.ID)
     
+    // ===== PUSH FULL STATE - League created =====
+    go h.PushFullState(user.ID, leagueID, "league_created", map[string]interface{}{
+        "league_id":   leagueID,
+        "team_count":  req.TeamCount,
+        "total_weeks": totalWeeks,
+        "difficulty":  req.Difficulty,
+        "league_type": leagueType,
+        "cost":        leagueCost,
+        "message":     fmt.Sprintf("League created! %d teams, %d weeks", req.TeamCount, totalWeeks),
+    })
+    
     // ===== RETURN SUCCESS =====
     respondJSON(w, http.StatusCreated, map[string]interface{}{
         "league_id":   leagueID,
@@ -354,14 +498,12 @@ func getLeagueType(teamCount int) string {
 func calculateLeagueCost(teamCount int, difficulty string) float64 {
     baseCost := 500.0
     
-    // Team count multiplier
     teamMultiplier := map[int]float64{
         5: 0.8, 6: 0.85, 7: 0.9, 8: 0.95, 9: 1.0, 10: 1.0,
         11: 1.1, 12: 1.2, 13: 1.3, 14: 1.4, 15: 1.5,
         16: 1.6, 17: 1.7, 18: 1.8, 19: 1.9, 20: 2.0,
     }
     
-    // Difficulty multiplier
     difficultyMultiplier := map[string]float64{
         "BEGINNER": 0.8, "EASY": 0.9, "NORMAL": 1.0, "CHALLENGING": 1.1,
         "HARD": 1.2, "EXPERT": 1.4, "MASTER": 1.6, "GRANDMASTER": 2.0,
@@ -396,7 +538,6 @@ func (h *Handler) scheduleDailyMatchesCustom(leagueID string, dayNumber int, tea
     firstKickoff := now.Add(5 * time.Minute)
     lastKickoff := now.Add(22 * time.Hour)
     
-    // Number of matches per day = teamCount / 2, capped at 10
     matchesPerDay := teamCount / 2
     if matchesPerDay > 10 {
         matchesPerDay = 10
@@ -438,7 +579,6 @@ func (h *Handler) generateRandomOdds(leagueID string) {
     if err != nil { return }
     defer rows.Close()
     
-    // Delete old calculated odds
     h.DB.Exec("DELETE FROM match_odds WHERE league_id=$1", leagueID)
     
     for rows.Next() {
@@ -459,289 +599,8 @@ func (h *Handler) generateRandomOdds(leagueID string) {
             math.Round((1.0/awayProb)*100)/100)
     }
 }
-func (h *Handler) GetFullLeague(w http.ResponseWriter, r *http.Request) {
-    leagueID := chi.URLParam(r, "leagueID")
-    
-    var league struct {
-        ID, Name, Type, Difficulty, Status string
-        TotalWeeks, DayNumber int
-    }
-    err := h.DB.Get(&league, "SELECT id, name, type, difficulty, total_weeks, status, day_number FROM leagues WHERE id=$1", leagueID)
-    if err != nil {
-        respondError(w, http.StatusNotFound, "League not found")
-        return
-    }
-    
-    respondJSON(w, http.StatusOK, league)
-}
 
-func (h *Handler) DeleteLeague(w http.ResponseWriter, r *http.Request) {
-    user := getUserFromContext(r.Context())
-    if !user.IsAdmin {
-        respondError(w, http.StatusForbidden, "Admin only")
-        return
-    }
-    
-    leagueID := chi.URLParam(r, "leagueID")
-    
-    h.DB.Exec("DELETE FROM daily_matches WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM match_results WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM match_odds WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM league_table WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM players WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM coaches WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM fixtures WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM teams WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM bets WHERE league_id=$1", leagueID)
-    h.DB.Exec("DELETE FROM leagues WHERE id=$1", leagueID)
-    
-    respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
-
-// func (h *Handler) scheduleDailyMatches(leagueID string, dayNumber int) {
-//     now := time.Now()
-//     firstKickoff := now.Add(5 * time.Minute)
-//     lastKickoff := now.Add(22 * time.Hour)
-    
-//     rows, _ := h.DB.Query(`
-//         SELECT f.id FROM fixtures f
-//         WHERE f.league_id = $1 AND f.week_number = $2
-//         ORDER BY f.id LIMIT 10
-//     `, leagueID, dayNumber)
-//     defer rows.Close()
-    
-//     var fixtureIDs []string
-//     for rows.Next() {
-//         var id string
-//         rows.Scan(&id)
-//         fixtureIDs = append(fixtureIDs, id)
-//     }
-    
-//     if len(fixtureIDs) == 0 { return }
-    
-//     totalWindow := lastKickoff.Sub(firstKickoff)
-//     interval := totalWindow / time.Duration(len(fixtureIDs)-1)
-    
-//     for i, fixID := range fixtureIDs {
-//         kickoff := firstKickoff.Add(time.Duration(i) * interval)
-//         h.DB.Exec(`INSERT INTO daily_matches (league_id, day_number, fixture_id, kickoff_time, status)
-//                    VALUES ($1, $2, $3, $4, 'SCHEDULED')`,
-//             leagueID, dayNumber, fixID, kickoff)
-//     }
-// }
-
-func (h *Handler) GetLeagueTable(w http.ResponseWriter, r *http.Request) {
-    leagueID := chi.URLParam(r, "leagueID")
-    
-    rows, _ := h.DB.Query(`
-        SELECT team_id, team_name, played, won, drawn, lost, goals_for, goals_against, points
-        FROM league_table WHERE league_id = $1
-        ORDER BY points DESC, (goals_for - goals_against) DESC
-    `, leagueID)
-    defer rows.Close()
-    
-    var table []map[string]interface{}
-    pos := 1
-    for rows.Next() {
-        var teamID, teamName string
-        var played, won, drawn, lost, gf, ga, pts int
-        rows.Scan(&teamID, &teamName, &played, &won, &drawn, &lost, &gf, &ga, &pts)
-        table = append(table, map[string]interface{}{
-            "position": pos, "team_id": teamID, "team_name": teamName,
-            "played": played, "won": won, "drawn": drawn, "lost": lost,
-            "goals_for": gf, "goals_against": ga, "goal_diff": gf - ga, "points": pts,
-        })
-        pos++
-    }
-    if table == nil { table = []map[string]interface{}{} }
-    respondJSON(w, http.StatusOK, table)
-}
-
-
-
-func (h *Handler) GetWeekResults(w http.ResponseWriter, r *http.Request) {
-    leagueID := chi.URLParam(r, "leagueID")
-    
-    rows, _ := h.DB.Query(`
-        SELECT mr.id, mr.week_number, t1.name as home_team, t2.name as away_team,
-               mr.home_score, mr.away_score, mr.winner,
-               COALESCE(mr.goals::text, '[]') as goals,
-               COALESCE(mr.stats::text, '{}') as stats,
-               mr.created_at
-        FROM match_results mr
-        JOIN teams t1 ON mr.home_team_id = t1.id
-        JOIN teams t2 ON mr.away_team_id = t2.id
-        WHERE mr.league_id = $1
-        ORDER BY mr.created_at DESC
-    `, leagueID)
-    defer rows.Close()
-    
-    var results []map[string]interface{}
-    for rows.Next() {
-        var id, home, away, winner, goalsJSON, statsJSON string
-        var week, hs, as int
-        var createdAt time.Time
-        rows.Scan(&id, &week, &home, &away, &hs, &as, &winner, &goalsJSON, &statsJSON, &createdAt)
-        
-        var goals, stats interface{}
-        json.Unmarshal([]byte(goalsJSON), &goals)
-        json.Unmarshal([]byte(statsJSON), &stats)
-        
-        results = append(results, map[string]interface{}{
-            "id": id, "week": week, 
-            "home_team": home, "away_team": away,
-            "home_score": hs, "away_score": as, "winner": winner,
-            "goals": goals,
-            "stats": stats,
-            "created_at": createdAt.Format(time.RFC3339),
-        })
-    }
-    if results == nil { results = []map[string]interface{}{} }
-    respondJSON(w, http.StatusOK, results)
-}
-
-func (h *Handler) GetMatchProbabilities(w http.ResponseWriter, r *http.Request) {
-    leagueID := chi.URLParam(r, "leagueID")
-    week := r.URL.Query().Get("week")
-    
-    query := `
-        SELECT mo.fixture_id, mo.home_win, mo.draw, mo.away_win, mo.home_odds, mo.draw_odds, mo.away_odds,
-               t1.name as home_team, t2.name as away_team
-        FROM match_odds mo
-        JOIN fixtures f ON mo.fixture_id = f.id
-        JOIN teams t1 ON f.home_team_id = t1.id
-        JOIN teams t2 ON f.away_team_id = t2.id
-        WHERE mo.league_id = $1
-    `
-    args := []interface{}{leagueID}
-    if week != "" {
-        query += " AND f.week_number = $2"
-        args = append(args, week)
-    }
-    
-    rows, _ := h.DB.Query(query, args...)
-    defer rows.Close()
-    
-    var odds []map[string]interface{}
-    for rows.Next() {
-        var fixtureID, homeTeam, awayTeam string
-        var homeWin, draw, awayWin, homeOdds, drawOdds, awayOdds float64
-        rows.Scan(&fixtureID, &homeWin, &draw, &awayWin, &homeOdds, &drawOdds, &awayOdds, &homeTeam, &awayTeam)
-        odds = append(odds, map[string]interface{}{
-            "fixture_id": fixtureID, "home_team": homeTeam, "away_team": awayTeam,
-            "probability": map[string]float64{"home": homeWin, "draw": draw, "away": awayWin},
-            "odds": map[string]float64{"home": homeOdds, "draw": drawOdds, "away": awayOdds},
-        })
-    }
-    if odds == nil { odds = []map[string]interface{}{} }
-    respondJSON(w, http.StatusOK, odds)
-}
-
-func (h *Handler) GetMatchResults(w http.ResponseWriter, r *http.Request) {
-    leagueID := chi.URLParam(r, "leagueID")
-    
-    rows, _ := h.DB.Query(`
-        SELECT mr.id, mr.week_number, 
-               t1.name as home_team, t2.name as away_team,
-               mr.home_score, mr.away_score, mr.winner,
-               COALESCE(mr.goals::text, '[]') as goals,
-               COALESCE(mr.stats::text, '{}') as stats,
-               mr.created_at
-        FROM match_results mr
-        JOIN teams t1 ON mr.home_team_id = t1.id
-        JOIN teams t2 ON mr.away_team_id = t2.id
-        WHERE mr.league_id = $1
-        ORDER BY mr.created_at ASC
-    `, leagueID)
-    defer rows.Close()
-    
-    var results []map[string]interface{}
-    for rows.Next() {
-        var id, home, away, winner, goalsJSON, statsJSON string
-        var week, hs, as int
-        var createdAt time.Time
-        rows.Scan(&id, &week, &home, &away, &hs, &as, &winner, &goalsJSON, &statsJSON, &createdAt)
-        
-        var goals, stats interface{}
-        json.Unmarshal([]byte(goalsJSON), &goals)
-        json.Unmarshal([]byte(statsJSON), &stats)
-        
-        results = append(results, map[string]interface{}{
-            "id": id, "week": week,
-            "home_team": home, "away_team": away,
-            "home_score": hs, "away_score": as, "winner": winner,
-            "goals": goals, "stats": stats,
-        })
-    }
-    if results == nil { results = []map[string]interface{}{} }
-    respondJSON(w, http.StatusOK, results)
-}
-// internal/handlers/league_handler.go - ADD THESE FUNCTIONS
-
-// ===== LEAGUE WINNER BET =====
-func (h *Handler) PlaceLeagueWinnerBet(w http.ResponseWriter, r *http.Request) {
-    user := getUserFromContext(r.Context())
-    leagueID := chi.URLParam(r, "leagueID")
-    
-    var req struct {
-        TeamID      string `json:"team_id"`
-        PointsRange string `json:"points_range"` // e.g., "70-80"
-    }
-    json.NewDecoder(r.Body).Decode(&req)
-    
-    // Verify league belongs to user and is in week 1 (not started)
-    var leagueUserID string
-    var dayNumber int
-    h.DB.QueryRow("SELECT user_id, day_number FROM leagues WHERE id=$1", leagueID).Scan(&leagueUserID, &dayNumber)
-    
-    if leagueUserID != user.ID {
-        respondError(w, http.StatusForbidden, "League not found")
-        return
-    }
-    
-    if dayNumber > 1 {
-        respondError(w, http.StatusBadRequest, "Winner bet only available before week 1 starts")
-        return
-    }
-    
-    // Check if already placed
-    var count int
-    h.DB.QueryRow("SELECT COUNT(*) FROM bets WHERE league_id=$1 AND user_id=$2 AND is_winner_bet=true", leagueID, user.ID).Scan(&count)
-    if count > 0 {
-        respondError(w, http.StatusBadRequest, "Already placed winner bet")
-        return
-    }
-    
-    // Get team count for prize calculation
-    var teamCount int
-    h.DB.QueryRow("SELECT COUNT(*) FROM teams WHERE league_id=$1", leagueID).Scan(&teamCount)
-    
-    // Prize: 5=$10K, 6=$50K, 7=$100K, 8=$150K, 10=$250K, 15=$500K, 20=$1M
-    prize := calculateWinnerBetPrize(teamCount)
-    
-    // Create bet with special flag
-    betID := "WBL_" + uuid.New().String()[:12]
-    betsJSON, _ := json.Marshal([]map[string]interface{}{
-        {
-            "fixture_id": leagueID,
-            "prediction": req.TeamID,
-            "points_range": req.PointsRange,
-        },
-    })
-    
-    h.DB.Exec(`INSERT INTO bets (id, user_id, league_id, week, bets, amount, total_odds, is_custom, status, is_winner_bet, placed_at)
-               VALUES ($1, $2, $3, 0, $4, 0, 0, false, 'PENDING', true, NOW())`,
-        betID, user.ID, leagueID, betsJSON)
-    
-    respondJSON(w, http.StatusCreated, map[string]interface{}{
-        "status": "placed",
-        "bet_id": betID,
-        "prize": prize,
-        "message": fmt.Sprintf("Winner bet placed! Win $%v if correct!", prize),
-    })
-}
-
-// ===== CALCULATE WINNER BET PRIZE =====
+// calculateWinnerBetPrize
 func calculateWinnerBetPrize(teamCount int) float64 {
     switch {
     case teamCount <= 5:
@@ -761,52 +620,8 @@ func calculateWinnerBetPrize(teamCount int) float64 {
     }
 }
 
-
-
-
-// ===== VALIDATE WINNER BET =====
-func (h *Handler) validateWinnerBet(leagueID string, userID string) {
-    // Get winner bet
-    var betID, betsStr string
-    h.DB.QueryRow("SELECT id, bets::text FROM bets WHERE league_id=$1 AND user_id=$2 AND is_winner_bet=true AND status='PENDING'", 
-        leagueID, userID).Scan(&betID, &betsStr)
-    
-    if betID == "" {
-        return // No winner bet
-    }
-    
-    // Get actual league winner from table
-    var winnerTeamID string
-    h.DB.QueryRow("SELECT team_id FROM league_table WHERE league_id=$1 ORDER BY points DESC LIMIT 1", leagueID).Scan(&winnerTeamID)
-    
-    var predictions []map[string]interface{}
-    json.Unmarshal([]byte(betsStr), &predictions)
-    
-    if len(predictions) > 0 {
-        predictedTeamID := predictions[0]["prediction"].(string)
-        
-        if predictedTeamID == winnerTeamID {
-            // WINNER!
-            var teamCount int
-            h.DB.QueryRow("SELECT COUNT(*) FROM teams WHERE league_id=$1", leagueID).Scan(&teamCount)
-            prize := calculateWinnerBetPrize(teamCount)
-            
-            h.DB.Exec("UPDATE bets SET status='WON', payout=$1, settled_at=NOW() WHERE id=$2", prize, betID)
-            h.DB.Exec("UPDATE wallets SET kash = kash + $1 WHERE user_id = $2", prize, userID)
-            
-            h.WSHub.SendToUser(userID, "winner_bet_won", map[string]interface{}{
-                "prize": prize,
-                "message": fmt.Sprintf("Winner bet correct! You won $%.0f!", prize),
-            })
-        } else {
-            h.DB.Exec("UPDATE bets SET status='LOST', settled_at=NOW() WHERE id=$1", betID)
-        }
-    }
-}
-
-// ===== GET LEAGUE COMPLETION DATA =====
+// getLeagueCompletionData
 func (h *Handler) getLeagueCompletionData(leagueID string) map[string]interface{} {
-    // Final table
     rows, _ := h.DB.Query("SELECT team_name, played, won, drawn, lost, points FROM league_table WHERE league_id=$1 ORDER BY points DESC LIMIT 3", leagueID)
     defer rows.Close()
     
@@ -825,7 +640,6 @@ func (h *Handler) getLeagueCompletionData(leagueID string) map[string]interface{
         })
     }
     
-    // Top scorer
     var scorerName string
     var scorerGoals int
     h.DB.QueryRow("SELECT player_name, goals FROM top_scorers WHERE league_id=$1 ORDER BY goals DESC LIMIT 1", leagueID).Scan(&scorerName, &scorerGoals)
@@ -839,11 +653,7 @@ func (h *Handler) getLeagueCompletionData(leagueID string) map[string]interface{
     }
 }
 
-
-
-
-
-// For sqlx transactions
+// deleteLeagueDataTx - For sqlx transactions
 func (h *Handler) deleteLeagueDataTx(tx *sqlx.Tx, leagueID string) {
     tx.Exec("DELETE FROM top_scorers WHERE league_id=$1", leagueID)
     tx.Exec("DELETE FROM league_table WHERE league_id=$1", leagueID)
@@ -859,7 +669,7 @@ func (h *Handler) deleteLeagueDataTx(tx *sqlx.Tx, leagueID string) {
     tx.Exec("DELETE FROM leagues WHERE id=$1", leagueID)
 }
 
-// For non-transaction (using DB directly)
+// deleteLeagueData - For non-transaction
 func (h *Handler) deleteLeagueData(leagueID string) {
     h.DB.Exec("DELETE FROM top_scorers WHERE league_id=$1", leagueID)
     h.DB.Exec("DELETE FROM league_table WHERE league_id=$1", leagueID)
@@ -875,72 +685,356 @@ func (h *Handler) deleteLeagueData(leagueID string) {
     h.DB.Exec("DELETE FROM leagues WHERE id=$1", leagueID)
 }
 
-// Forfeit with transaction
-func (h *Handler) ForfeitLeague(w http.ResponseWriter, r *http.Request) {
-    user := getUserFromContext(r.Context())
-    leagueID := chi.URLParam(r, "leagueID")
-    
-    if user == nil {
-        respondError(w, http.StatusUnauthorized, "Unauthorized")
-        return
-    }
-    
-    // Check if league exists
-    var leagueUserID string
-    err := h.DB.QueryRow("SELECT user_id FROM leagues WHERE id=$1", leagueID).Scan(&leagueUserID)
-    
-    if err != nil {
-        respondJSON(w, http.StatusOK, map[string]interface{}{
-            "status": "already_deleted",
-            "message": "League already forfeited",
-        })
-        return
-    }
-    
-    if leagueUserID != user.ID {
-        respondError(w, http.StatusForbidden, "Not your league")
-        return
-    }
-    
-    // Start transaction
-    tx, err := h.DB.Beginx()
-    if err != nil {
-        respondError(w, http.StatusInternalServerError, "Transaction error")
-        return
-    }
-    defer tx.Rollback()
-    
-    // Check wallet within transaction
-    var kash float64
-    err = tx.QueryRow("SELECT kash FROM wallets WHERE user_id=$1", user.ID).Scan(&kash)
-    if err != nil {
-        respondError(w, http.StatusBadRequest, "Wallet not found")
-        return
-    }
-    
-    if kash < 100 {
-        respondError(w, http.StatusBadRequest, "Need $100 to forfeit")
-        return
-    }
-    
-    // Deduct penalty
-    tx.Exec("UPDATE wallets SET kash = kash - 100 WHERE user_id = $1", user.ID)
-    
-    // Delete all data in transaction
-    h.deleteLeagueDataTx(tx, leagueID)
-    
-    // Commit
-    if err := tx.Commit(); err != nil {
-        respondError(w, http.StatusInternalServerError, "Failed to commit")
-        return
-    }
-    
-    h.WSHub.SendToUser(user.ID, "league_forfeited", map[string]interface{}{
-        "message": "League forfeited. $100 penalty deducted.",
-    })
-    
-    respondJSON(w, http.StatusOK, map[string]interface{}{
-        "status": "forfeited",
-        "penalty": 100,
-    })
+// GetMyLeagues - Returns all leagues for current user
+func (h *Handler) GetMyLeagues(w http.ResponseWriter, r *http.Request) {
+	user := getUserFromContext(r.Context())
+	
+	if user == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	
+	rows, err := h.DB.Query(`
+		SELECT l.id, l.name, l.type, l.difficulty, l.total_weeks, l.status, l.day_number
+		FROM leagues l
+		WHERE l.user_id = $1
+		ORDER BY l.created_at DESC
+	`, user.ID)
+	
+	if err != nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	defer rows.Close()
+	
+	var leagues []map[string]interface{}
+	for rows.Next() {
+		var id, name, ltype, diff, status string
+		var weeks, day int
+		rows.Scan(&id, &name, &ltype, &diff, &weeks, &status, &day)
+		leagues = append(leagues, map[string]interface{}{
+			"id":          id,
+			"name":        name,
+			"type":        ltype,
+			"difficulty":  diff,
+			"total_weeks": weeks,
+			"status":      status,
+			"day_number":  day,
+		})
+	}
+	
+	if leagues == nil {
+		leagues = []map[string]interface{}{}
+	}
+	
+	respondJSON(w, http.StatusOK, leagues)
+}
+
+// GetFullLeague - Returns basic league info
+func (h *Handler) GetFullLeague(w http.ResponseWriter, r *http.Request) {
+	leagueID := chi.URLParam(r, "leagueID")
+	
+	var league struct {
+		ID         string `db:"id"`
+		Name       string `db:"name"`
+		Type       string `db:"type"`
+		Difficulty string `db:"difficulty"`
+		Status     string `db:"status"`
+		TotalWeeks int    `db:"total_weeks"`
+		DayNumber  int    `db:"day_number"`
+	}
+	
+	err := h.DB.Get(&league, `
+		SELECT id, name, type, difficulty, total_weeks, status, day_number 
+		FROM leagues WHERE id=$1
+	`, leagueID)
+	
+	if err != nil {
+		respondError(w, http.StatusNotFound, "League not found")
+		return
+	}
+	
+	respondJSON(w, http.StatusOK, league)
+}
+
+// GetLeagueTable - Returns league standings
+func (h *Handler) GetLeagueTable(w http.ResponseWriter, r *http.Request) {
+	leagueID := chi.URLParam(r, "leagueID")
+	
+	rows, err := h.DB.Query(`
+		SELECT team_id, team_name, played, won, drawn, lost, goals_for, goals_against, points
+		FROM league_table WHERE league_id = $1
+		ORDER BY points DESC, (goals_for - goals_against) DESC
+	`, leagueID)
+	
+	if err != nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	defer rows.Close()
+	
+	var table []map[string]interface{}
+	pos := 1
+	for rows.Next() {
+		var teamID, teamName string
+		var played, won, drawn, lost, gf, ga, pts int
+		rows.Scan(&teamID, &teamName, &played, &won, &drawn, &lost, &gf, &ga, &pts)
+		table = append(table, map[string]interface{}{
+			"position":      pos,
+			"team_id":       teamID,
+			"team_name":     teamName,
+			"played":        played,
+			"won":           won,
+			"drawn":         drawn,
+			"lost":          lost,
+			"goals_for":     gf,
+			"goals_against": ga,
+			"goal_diff":     gf - ga,
+			"points":        pts,
+		})
+		pos++
+	}
+	
+	if table == nil {
+		table = []map[string]interface{}{}
+	}
+	
+	respondJSON(w, http.StatusOK, table)
+}
+
+// GetMatchResults - Returns match results for a league
+func (h *Handler) GetMatchResults(w http.ResponseWriter, r *http.Request) {
+	leagueID := chi.URLParam(r, "leagueID")
+	
+	rows, err := h.DB.Query(`
+		SELECT mr.id, mr.week_number, 
+		       t1.name as home_team, t2.name as away_team,
+		       mr.home_score, mr.away_score, mr.winner,
+		       COALESCE(mr.goals::text, '[]') as goals,
+		       COALESCE(mr.stats::text, '{}') as stats,
+		       mr.created_at
+		FROM match_results mr
+		JOIN teams t1 ON mr.home_team_id = t1.id
+		JOIN teams t2 ON mr.away_team_id = t2.id
+		WHERE mr.league_id = $1
+		ORDER BY mr.created_at ASC
+	`, leagueID)
+	
+	if err != nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	defer rows.Close()
+	
+	var results []map[string]interface{}
+	for rows.Next() {
+		var id, home, away, winner, goalsJSON, statsJSON string
+		var week, hs, as int
+		var createdAt time.Time
+		
+		rows.Scan(&id, &week, &home, &away, &hs, &as, &winner, &goalsJSON, &statsJSON, &createdAt)
+		
+		var goals, stats interface{}
+		json.Unmarshal([]byte(goalsJSON), &goals)
+		json.Unmarshal([]byte(statsJSON), &stats)
+		
+		results = append(results, map[string]interface{}{
+			"id":         id,
+			"week":       week,
+			"home_team":  home,
+			"away_team":  away,
+			"home_score": hs,
+			"away_score": as,
+			"winner":     winner,
+			"goals":      goals,
+			"stats":      stats,
+		})
+	}
+	
+	if results == nil {
+		results = []map[string]interface{}{}
+	}
+	
+	respondJSON(w, http.StatusOK, results)
+}
+
+// GetMatchProbabilities - Returns match odds/probabilities
+func (h *Handler) GetMatchProbabilities(w http.ResponseWriter, r *http.Request) {
+	leagueID := chi.URLParam(r, "leagueID")
+	week := r.URL.Query().Get("week")
+	
+	query := `
+		SELECT mo.fixture_id, mo.home_win, mo.draw, mo.away_win, mo.home_odds, mo.draw_odds, mo.away_odds,
+		       t1.name as home_team, t2.name as away_team
+		FROM match_odds mo
+		JOIN fixtures f ON mo.fixture_id = f.id
+		JOIN teams t1 ON f.home_team_id = t1.id
+		JOIN teams t2 ON f.away_team_id = t2.id
+		WHERE mo.league_id = $1
+	`
+	args := []interface{}{leagueID}
+	
+	if week != "" {
+		query += " AND f.week_number = $2"
+		args = append(args, week)
+	}
+	
+	rows, err := h.DB.Query(query, args...)
+	if err != nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	defer rows.Close()
+	
+	var odds []map[string]interface{}
+	for rows.Next() {
+		var fixtureID, homeTeam, awayTeam string
+		var homeWin, draw, awayWin, homeOdds, drawOdds, awayOdds float64
+		
+		rows.Scan(&fixtureID, &homeWin, &draw, &awayWin, &homeOdds, &drawOdds, &awayOdds, &homeTeam, &awayTeam)
+		
+		odds = append(odds, map[string]interface{}{
+			"fixture_id": fixtureID,
+			"home_team":  homeTeam,
+			"away_team":  awayTeam,
+			"probability": map[string]float64{
+				"home": homeWin,
+				"draw": draw,
+				"away": awayWin,
+			},
+			"odds": map[string]float64{
+				"home": homeOdds,
+				"draw": drawOdds,
+				"away": awayOdds,
+			},
+		})
+	}
+	
+	if odds == nil {
+		odds = []map[string]interface{}{}
+	}
+	
+	respondJSON(w, http.StatusOK, odds)
+}
+
+// GetAvailableLeagues - Returns available leagues (optional, if needed)
+func (h *Handler) GetAvailableLeagues(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.DB.Query(`
+		SELECT l.id, l.name, l.type, l.difficulty, l.total_weeks,
+		       COUNT(ul.user_id) as user_count
+		FROM leagues l
+		LEFT JOIN user_leagues ul ON l.id = ul.league_id
+		WHERE l.status = 'ACTIVE'
+		GROUP BY l.id
+		ORDER BY user_count DESC, l.name
+	`)
+	
+	if err != nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	defer rows.Close()
+	
+	var leagues []map[string]interface{}
+	for rows.Next() {
+		var id, name, ltype, diff string
+		var weeks, count int
+		rows.Scan(&id, &name, &ltype, &diff, &weeks, &count)
+		leagues = append(leagues, map[string]interface{}{
+			"id":          id,
+			"name":        name,
+			"type":        ltype,
+			"difficulty":  diff,
+			"total_weeks": weeks,
+			"user_count":  count,
+			"is_empty":    count == 0,
+			"is_popular":  count >= 5,
+		})
+	}
+	
+	if leagues == nil {
+		leagues = []map[string]interface{}{}
+	}
+	
+	respondJSON(w, http.StatusOK, leagues)
+}
+
+// GetWeekResults - Returns results for a specific week (optional)
+func (h *Handler) GetWeekResults(w http.ResponseWriter, r *http.Request) {
+	leagueID := chi.URLParam(r, "leagueID")
+	
+	rows, err := h.DB.Query(`
+		SELECT mr.id, mr.week_number, t1.name as home_team, t2.name as away_team,
+		       mr.home_score, mr.away_score, mr.winner,
+		       COALESCE(mr.goals::text, '[]') as goals,
+		       COALESCE(mr.stats::text, '{}') as stats,
+		       mr.created_at
+		FROM match_results mr
+		JOIN teams t1 ON mr.home_team_id = t1.id
+		JOIN teams t2 ON mr.away_team_id = t2.id
+		WHERE mr.league_id = $1
+		ORDER BY mr.created_at DESC
+	`, leagueID)
+	
+	if err != nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	defer rows.Close()
+	
+	var results []map[string]interface{}
+	for rows.Next() {
+		var id, home, away, winner, goalsJSON, statsJSON string
+		var week, hs, as int
+		var createdAt time.Time
+		
+		rows.Scan(&id, &week, &home, &away, &hs, &as, &winner, &goalsJSON, &statsJSON, &createdAt)
+		
+		var goals, stats interface{}
+		json.Unmarshal([]byte(goalsJSON), &goals)
+		json.Unmarshal([]byte(statsJSON), &stats)
+		
+		results = append(results, map[string]interface{}{
+			"id":         id,
+			"week":       week,
+			"home_team":  home,
+			"away_team":  away,
+			"home_score": hs,
+			"away_score": as,
+			"winner":     winner,
+			"goals":      goals,
+			"stats":      stats,
+			"created_at": createdAt.Format(time.RFC3339),
+		})
+	}
+	
+	if results == nil {
+		results = []map[string]interface{}{}
+	}
+	
+	respondJSON(w, http.StatusOK, results)
+}
+
+// DeleteLeague - Deletes a league (admin only)
+func (h *Handler) DeleteLeague(w http.ResponseWriter, r *http.Request) {
+	user := getUserFromContext(r.Context())
+	if !user.IsAdmin {
+		respondError(w, http.StatusForbidden, "Admin only")
+		return
+	}
+	
+	leagueID := chi.URLParam(r, "leagueID")
+	
+	h.DB.Exec("DELETE FROM daily_matches WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM match_results WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM match_odds WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM league_table WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM players WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM coaches WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM fixtures WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM teams WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM bets WHERE league_id=$1", leagueID)
+	h.DB.Exec("DELETE FROM leagues WHERE id=$1", leagueID)
+	
+	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
